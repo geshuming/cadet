@@ -10,6 +10,7 @@ defmodule CadetWeb.GradingControllerTest do
     GradingController.swagger_path_index(nil)
     GradingController.swagger_path_show(nil)
     GradingController.swagger_path_update(nil)
+    GradingController.swagger_path_unsubmit(nil)
   end
 
   describe "GET /, unauthenticated" do
@@ -119,6 +120,9 @@ defmodule CadetWeb.GradingControllerTest do
             },
             "groupName" => submission.student.group.name,
             "status" => Atom.to_string(submission.status),
+            "questionCount" => 4,
+            "gradedCount" => 4,
+            "gradingStatus" => "excluded",
             "unsubmittedBy" => nil,
             "unsubmittedAt" => nil
           }
@@ -159,6 +163,9 @@ defmodule CadetWeb.GradingControllerTest do
             },
             "groupName" => submission.student.group.name,
             "status" => Atom.to_string(submission.status),
+            "questionCount" => 4,
+            "gradedCount" => 4,
+            "gradingStatus" => "excluded",
             "unsubmittedAt" => nil,
             "unsubmittedBy" => nil
           }
@@ -217,6 +224,9 @@ defmodule CadetWeb.GradingControllerTest do
             },
             "groupName" => submission.student.group.name,
             "status" => Atom.to_string(submission.status),
+            "questionCount" => 4,
+            "gradedCount" => 4,
+            "gradingStatus" => "excluded",
             "unsubmittedAt" => nil,
             "unsubmittedBy" => nil
           }
@@ -488,7 +498,7 @@ defmodule CadetWeb.GradingControllerTest do
 
       assert %{
                adjustment: -10,
-               comment: "Never gonna give you up",
+               comment: comment,
                xp_adjustment: -10,
                grader_id: ^grader_id
              } = Repo.get(Answer, answer.id)
@@ -548,7 +558,7 @@ defmodule CadetWeb.GradingControllerTest do
 
       assert %{
                adjustment: -100,
-               comment: "Your awesome",
+               comment: comment,
                xp_adjustment: -100,
                grader_id: ^mentor_id
              } = Repo.get(Answer, answer.id)
@@ -601,7 +611,8 @@ defmodule CadetWeb.GradingControllerTest do
       assert submission_db.unsubmitted_by_id === grader.id
       assert submission_db.unsubmitted_at != nil
 
-      assert answer_db.comment == nil
+      # Chatkit roomid should not be removed when a submission is unsubmitted
+      assert answer_db.comment == answer.comment
       assert answer_db.autograding_status == :none
       assert answer_db.autograding_results == []
       assert answer_db.grader_id == nil
@@ -760,7 +771,8 @@ defmodule CadetWeb.GradingControllerTest do
       assert submission_db.unsubmitted_by_id === admin.id
       assert submission_db.unsubmitted_at != nil
 
-      assert answer_db.comment == nil
+      # Chatkit roomid should not be removed when a submission is unsubmitted
+      assert answer_db.comment == answer.comment
       assert answer_db.autograding_status == :none
       assert answer_db.autograding_results == []
       assert answer_db.grader_id == nil
@@ -809,6 +821,9 @@ defmodule CadetWeb.GradingControllerTest do
             },
             "groupName" => submission.student.group.name,
             "status" => Atom.to_string(submission.status),
+            "questionCount" => 4,
+            "gradedCount" => 4,
+            "gradingStatus" => "excluded",
             "unsubmittedAt" => nil,
             "unsubmittedBy" => nil
           }
@@ -851,6 +866,9 @@ defmodule CadetWeb.GradingControllerTest do
             },
             "groupName" => submission.student.group.name,
             "status" => Atom.to_string(submission.status),
+            "questionCount" => 4,
+            "gradedCount" => 4,
+            "gradingStatus" => "excluded",
             "unsubmittedAt" => nil,
             "unsubmittedBy" => nil
           }
@@ -994,7 +1012,7 @@ defmodule CadetWeb.GradingControllerTest do
         })
 
       assert response(conn, 200) == "OK"
-      assert %{adjustment: -10, comment: "Never gonna give you up"} = Repo.get(Answer, answer.id)
+      assert %{adjustment: -10, comment: comment} = Repo.get(Answer, answer.id)
     end
 
     @tag authenticate: :admin

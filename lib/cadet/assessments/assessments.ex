@@ -10,13 +10,13 @@ defmodule Cadet.Assessments do
   alias Cadet.Accounts.User
   alias Cadet.Assessments.{Answer, Assessment, Query, Question, Submission}
   alias Cadet.Autograder.GradingJob
+  alias Cadet.Chat.Room
   alias Ecto.Multi
 
   @xp_early_submission_max_bonus 100
   @xp_bonus_assessment_type ~w(mission sidequest)a
   @submit_answer_roles ~w(student)a
   @unsubmit_assessment_role ~w(staff admin)a
-  @grading_roles ~w()a
   @see_all_submissions_roles ~w(staff admin)a
   @open_all_assessment_roles ~w(staff admin)a
 
@@ -201,18 +201,30 @@ defmodule Cadet.Assessments do
         %{
           assessment
           | grading_status:
-              build_grading_status(assessment.question_count, assessment.graded_count)
+              build_grading_status(
+                assessment.user_status,
+                assessment.type,
+                assessment.question_count,
+                assessment.graded_count
+              )
         }
       end)
 
     {:ok, assessments}
   end
 
-  defp build_grading_status(q_count, g_count) do
-    cond do
-      g_count < q_count -> :grading
-      g_count == q_count -> :graded
-      true -> :none
+  defp build_grading_status(submission_status, a_type, q_count, g_count) do
+    case a_type do
+      type when type in [:mission, :sidequest] ->
+        cond do
+          submission_status != :submitted -> :excluded
+          g_count < q_count -> :grading
+          g_count == q_count -> :graded
+          true -> :none
+        end
+
+      _ ->
+        :excluded
     end
   end
 
@@ -351,8 +363,13 @@ defmodule Cadet.Assessments do
            {:is_open?, true} <- is_open?(question.assessment),
            {:ok, submission} <- find_or_create_submission(user, question.assessment),
            {:status, true} <- {:status, submission.status != :submitted},
-           {:ok, _} <- insert_or_update_answer(submission, question, raw_answer) do
+           {:ok, answer} <- insert_or_update_answer(submission, question, raw_answer) do
         update_submission_status(submission, question.assessment)
+
+        if answer.comment == nil do
+          Room.create_rooms(submission, answer, user)
+        end
+
         {:ok, nil}
       else
         {:question_found?, false} -> {:error, {:not_found, "Question not found"}}
@@ -456,7 +473,6 @@ defmodule Cadet.Assessments do
                    xp_adjustment: 0,
                    autograding_status: :none,
                    autograding_results: [],
-                   comment: nil,
                    grader_id: nil
                  })
                  |> Repo.update()}
@@ -561,7 +577,7 @@ defmodule Cadet.Assessments do
         on: s.id == x.submission_id
       )
       |> join(:inner, [s, _], st in assoc(s, :student))
-      |> join(:inner, [_, _, st], g in assoc(st, :group))
+      |> join(:left, [_, _, st], g in assoc(st, :group))
       |> join(:left, [s, _, _, g], u in assoc(s, :unsubmitted_by))
       |> join(
         :inner,
@@ -569,7 +585,19 @@ defmodule Cadet.Assessments do
         a in subquery(Query.all_assessments_with_max_xp_and_grade()),
         on: s.assessment_id == a.id
       )
-      |> select([s, x, st, g, u, a], %Submission{
+      |> join(
+        :inner,
+        [_, _, _, _, _, a],
+        q_count in subquery(Query.assessments_question_count()),
+        on: a.id == q_count.assessment_id
+      )
+      |> join(
+        :left,
+        [s, _, _, _, _, a, _],
+        g_count in subquery(Query.submissions_graded_count()),
+        on: s.id == g_count.submission_id
+      )
+      |> select([s, x, st, g, u, a, q_count, g_count], %Submission{
         s
         | grade: x.grade,
           adjustment: x.adjustment,
@@ -578,31 +606,40 @@ defmodule Cadet.Assessments do
           student: st,
           assessment: a,
           group_name: g.name,
-          unsubmitted_by: u
+          unsubmitted_by: u,
+          question_count: q_count.count,
+          graded_count: g_count.count
       })
 
-    cond do
-      role in @grading_roles ->
-        {:ok, submissions_by_group(grader, submission_query)}
+    if role in @see_all_submissions_roles do
+      submissions =
+        if group_only do
+          submissions_by_group(grader, submission_query)
+        else
+          Repo.all(submission_query)
+        end
 
-      role in @see_all_submissions_roles ->
-        submissions =
-          if group_only do
-            submissions_by_group(grader, submission_query)
-          else
-            Repo.all(submission_query)
-          end
-
-        {:ok, submissions}
-
-      true ->
-        {:error, {:unauthorized, "User is not permitted to grade."}}
+      {:ok, build_submission_grading_status(submissions)}
+    else
+      {:error, {:unauthorized, "User is not permitted to grade."}}
     end
+  end
+
+  # Constructs grading status for each submission
+  defp build_submission_grading_status(submissions) do
+    submissions
+    |> Enum.map(fn s = %Submission{} ->
+      %{
+        s
+        | grading_status:
+            build_grading_status(s.status, s.assessment.type, s.question_count, s.graded_count)
+      }
+    end)
   end
 
   @spec get_answers_in_submission(integer() | String.t(), %User{}) ::
           {:ok, [%Answer{}]} | {:error, {:unauthorized, String.t()}}
-  def get_answers_in_submission(id, grader = %User{role: role}) when is_ecto_id(id) do
+  def get_answers_in_submission(id, %User{role: role}) when is_ecto_id(id) do
     answer_query =
       Answer
       |> where(submission_id: ^id)
@@ -612,28 +649,15 @@ defmodule Cadet.Assessments do
       |> join(:inner, [a, ..., s], st in assoc(s, :student))
       |> preload([_, q, g, s, st], question: q, grader: g, submission: {s, student: st})
 
-    cond do
-      role in @grading_roles ->
-        students = Cadet.Accounts.Query.students_of(grader)
+    if role in @see_all_submissions_roles do
+      answers =
+        answer_query
+        |> Repo.all()
+        |> Enum.sort_by(& &1.question.display_order)
 
-        answers =
-          answer_query
-          |> join(:inner, [..., s, _], t in subquery(students), on: t.id == s.student_id)
-          |> Repo.all()
-          |> Enum.sort_by(& &1.question.display_order)
-
-        {:ok, answers}
-
-      role in @see_all_submissions_roles ->
-        answers =
-          answer_query
-          |> Repo.all()
-          |> Enum.sort_by(& &1.question.display_order)
-
-        {:ok, answers}
-
-      true ->
-        {:error, {:unauthorized, "User is not permitted to grade."}}
+      {:ok, answers}
+    else
+      {:error, {:unauthorized, "User is not permitted to grade."}}
     end
   end
 
@@ -647,28 +671,16 @@ defmodule Cadet.Assessments do
   def update_grading_info(
         %{submission_id: submission_id, question_id: question_id},
         attrs,
-        grader = %User{id: grader_id, role: role}
+        %User{id: grader_id, role: role}
       )
       when is_ecto_id(submission_id) and is_ecto_id(question_id) and
-             (role in @grading_roles or role in @see_all_submissions_roles) do
+             role in @see_all_submissions_roles do
     attrs = Map.put(attrs, "grader_id", grader_id)
 
     answer_query =
       Answer
       |> where(submission_id: ^submission_id)
       |> where(question_id: ^question_id)
-
-    # checks if role is in @grading_roles or @see_all_submissions_roles
-    answer_query =
-      if role in @grading_roles do
-        students = Cadet.Accounts.Query.students_of(grader)
-
-        answer_query
-        |> join(:inner, [a], s in assoc(a, :submission))
-        |> join(:inner, [a, s], t in subquery(students), on: t.id == s.student_id)
-      else
-        answer_query
-      end
 
     answer = Repo.one(answer_query)
 
